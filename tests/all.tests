@@ -43,6 +43,7 @@ Default
 Multi
 Exists
 TypeEq
+GadtFamPat
 Sieve
 Dict
 Symbol
