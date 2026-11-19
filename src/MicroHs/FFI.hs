@@ -25,7 +25,7 @@ makeFFI _ forExps exclude dss =
       jsincs   = if any isJS ffiImports then ["emscripten.h"] else []
         where isJS (ImpJS _, _, _, _) = True
               isJS _ = False
-      mkSig (_, i, CType t, js) = let (as, ior) = getArrows t in mkExportSig js i as ior ++ ";"
+      mkSig (_, i, CType t, js) = let (as, ior) = getArrows (dropForall t) in mkExportSig js i as ior ++ ";"
       header = unlines
         ["#include <stdint.h>",
          "#if defined(__cplusplus)",
@@ -75,7 +75,7 @@ mkExport (i, _, _, _) = "  { \"" ++ unIdent i ++ "\", 0 },"
 
 mkExportWrapper :: Int -> (Ident, Ident, CType, IsJavascript) -> String
 mkExportWrapper no (_, n, CType t, js) = unlines $
-  let (as, ior) = getArrows t
+  let (as, ior) = getArrows (dropForall t)
       r = checkIO ior
       outT = expTypeName js r
       arg k a = "  mhs_from_" ++ expTypeHsName js a ++ "(ffe_alloc(), 0, _x" ++ show k ++ "); ffe_apply();"
@@ -114,7 +114,7 @@ mkMhsFun fn body = "from_t mhs_" ++ fn ++ "(int s) { " ++ body ++ "; }"
 
 checkIO :: EType -> EType
 checkIO iot =
-  case dropApp identIO iot of
+  case dropApp identIO (dropForall iot) of
     Nothing -> iot -- errorMessage (getSLoc iot) $ "foreign return type must be IO: " ++ showEType iot
     Just t  -> t
 
@@ -148,7 +148,7 @@ mkHdr (ImpStatic _ IPtr fn, f, iot, _) =
       body = "return " ++ mkRet r 0 (s ++ "&" ++ fn)
   in  mkMhsFun ("addr_" ++ f) body
 mkHdr (ImpStatic _ IFunc fn, f, t, _) =
-  let (as, ior) = getArrows t
+  let (as, ior) = getArrows (dropForall t)
       r = checkIO ior
       len = length as
       call = fn ++ "(" ++ intercalate ", " (zipWith mkArg as [0..]) ++ ")"
@@ -159,7 +159,7 @@ mkHdr (ImpStatic _ IFunc fn, f, t, _) =
           "return " ++ mkRet r len call
   in  mkMhsFun f fcall
 mkHdr (ImpStatic _ IValue val, f, t, _) =
-  let (as, ior) = getArrows t
+  let (as, ior) = getArrows (dropForall t)
       r = checkIO ior
       len = length as
       call = expand val
@@ -175,7 +175,7 @@ mkHdr (ImpStatic _ IValue val, f, t, _) =
           "return " ++ mkRet r len call
   in  mkMhsFun f fcall
 mkHdr (ImpJS s, f, ty, _) =
-  let (as, ior) = getArrows ty
+  let (as, ior) = getArrows (dropForall ty)
       rt = checkIO ior
       jsr = jsTypeNameR rt
       n = length as
@@ -193,7 +193,11 @@ mkHdr (ImpJS s, f, ty, _) =
 mkHdr _ = undefined
 
 arity :: EType -> Int
-arity = length . fst . getArrows
+arity = length . fst . getArrows . dropForall
+
+dropForall :: EType -> EType
+dropForall (EForall _ _ u) = dropForall u
+dropForall u = u
 
 -- Use to construct 'foreign import/export ccall' wrapper.
 cTypeHsName :: HasCallStack => EType -> String
