@@ -6774,6 +6774,12 @@ evali(NODEPTR an)
       int a = (int)GETVALUE(n);   /* function number */
       //printf("  %s\n", FFI_IX(a).ffi_name);
       int arity = FFI_IX(a).ffi_arity;
+      if (arity > 0 && HASNARGS(arity + 2) && ARG(TOP(0)) == combWorld && ARG(TOP(1)) == combK) {
+        /* Precompiled base-0.16.12.0.pkg desugared polymorphic `foreign import`
+         * (`EForall _ _ (... -> IO r)`) as `IO.performIO ^f`, pushing `combWorld`
+         * and `combK` ahead of the real FFI arguments. Drop those two nodes. */
+        POP(2);
+      }
       CHECK(arity);
       funptr_t f = FFI_IX(a).ffi_fun;
       PUSH(mkPtr(0));             /* placeholder for result, protected from GC */
@@ -7473,7 +7479,11 @@ evali(NODEPTR an)
     unint64:
       switch (GETTAG(p)) {
       case T_IND:        p = GETINDIR(p); goto unint64;
-      case T_NEG64:      if ((int64_t)x64u == INT64_MIN) raise_rts(exn_overflow); r64u = -x64u; break;
+      case T_NEG64:
+#if WANT_OVERFLOW
+                         if ((int64_t)x64u == INT64_MIN) raise_rts(exn_overflow);
+#endif
+                         r64u = -x64u; break;
       case T_UNEG64:     r64u = -x64u; break;
       case T_INV64:      r64u = ~x64u; break;
       case T_POPCOUNT64: ru = POPCOUNT64(x64u); SETINT(n, (value_t)ru); goto ret;
