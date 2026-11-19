@@ -16,6 +16,7 @@ module MicroHs.Compile(
   getPaths,
   loadPkg,
   addPreludeImport,
+  headerPreludeSetting,
   loadEmbedded,
   ) where
 import qualified Prelude(); import MHSPrelude
@@ -74,7 +75,9 @@ compileMany :: Flags -> [IdentModule] -> Cache -> IO Cache
 compileMany flags mns ach = do
   execStateIO (do mapM_ (loadPkg flags) (preload flags)
                   mapM_ (loadEmbedPkg flags) Embed.packages
-                  mapM_ (compileModuleCached flags ImpNormal) mns)
+                  mapM_ (compileModuleCached flags ImpNormal) mns
+                  loadBoots flags
+                  loadDependencies flags)
               ach
 
 loadEmbedded :: Flags -> Cache -> IO Cache
@@ -216,7 +219,8 @@ compileModule flags impt mn pathfn file = do
     liftIO $ putStrLn $ "parsed:\n" ++ prettyShow pmdl
   when (isNothing (getFileName mn) && mn /= mnn) $
     mhsErrorLoc (getSLoc mnn) $ "module name does not agree with file name: " ++ showIdent mn ++ " " ++ showIdent mnn
-  ((dmdl, syms, imported, tTCDesug, tImp), _) <- compileModuleP flags impt (addPreludeImport pmdl)
+  let noImpPrel = fromMaybe (noImplicitPrelude flags) (headerPreludeSetting file)
+  ((dmdl, syms, imported, tTCDesug, tImp), _) <- compileModuleP flags impt (addPreludeImport noImpPrel pmdl)
 
   t4 <- liftIO getTimeMilli
   cmdl <- liftIO $ evaluate $ compileToCombinators dmdl
@@ -235,7 +239,13 @@ compileModule flags impt mn pathfn file = do
     liftIO $ putStrLn $ "loaded " ++ showIdent mn ++ " (" ++ pathfn ++ ")"
 
   case impt of
-    ImpNormal -> modify $ workToDone (cmdl, map snd imported, chksum)
+    ImpNormal -> do
+      hadBoots <- not . null <$> gets getBoots
+      modify $ workToDone (cmdl, map snd imported, chksum)
+      c' <- get
+      when (writeCache flags && null (getBoots c') &&
+            (hadBoots || length (cachedNonPkgModuleNames c') `rem` 120 == 0)) $
+        liftIO $ saveCache (cacheName flags) (clearWorking c')
     ImpBoot   -> return ()
   return (cmdl, syms, tThis + tImp)
 
@@ -275,8 +285,9 @@ compileToCombinators dmdl =
 -- No implicitr imports are added when
 --   import qualified Prelude()
 -- is present.
-addPreludeImport :: EModule -> EModule
-addPreludeImport (EModule mn es ds) =
+-- When the first argument is True (NoImplicitPrelude) only B@ is added.
+addPreludeImport :: Bool -> EModule -> EModule
+addPreludeImport noImpPrel (EModule mn es ds) =
   EModule mn es ds'
   where ds' = ps' ++ nps
         (ps, nps) = partition isImportPrelude ds
@@ -286,10 +297,80 @@ addPreludeImport (EModule mn es ds) =
         iblt = Import $ ImportSpec ImpNormal True builtinMdlQ (Just builtinMdl) Nothing
         ps' =
           case ps of
-            [] -> [Import $ ImportSpec ImpNormal False idPrelude Nothing Nothing,      -- no Prelude imports, so add 'import Prelude'
-                   iblt]                                                               -- and 'import Mhs.Builtin as B@'
+            [] | noImpPrel -> [iblt]                                                   -- NoImplicitPrelude: only 'import Mhs.Builtin as B@'
+               | otherwise -> [Import $ ImportSpec ImpNormal False idPrelude Nothing Nothing,  -- no Prelude imports, so add 'import Prelude'
+                               iblt]                                                   -- and 'import Mhs.Builtin as B@'
             [Import (ImportSpec ImpNormal True _ Nothing (Just (False, [])))] -> []    -- exactly 'import qualified Prelude()', so import nothing
             _ -> iblt : ps                                                             -- keep the given Prelude imports, add Builtin
+
+-- Scan the file header for {-# LANGUAGE ... #-} pragmas appearing before
+-- the 'module' keyword (or the first top-level declaration).
+-- Skips '--' line comments and nested '{- ... -}' comments (as well as
+-- '#...'-style CPP output lines like '#line ...').
+-- Returns Just True if the last NoImplicitPrelude/ImplicitPrelude mention
+-- disables the implicit Prelude import, Just False if it re-enables it,
+-- and Nothing if neither appears.
+headerPreludeSetting :: String -> Maybe Bool
+headerPreludeSetting file = scanHeader Nothing (dropShebang file)
+  where
+    dropShebang ('#':'!':cs) = dropWhile (/= '\n') cs
+    dropShebang cs = cs
+
+    scanHeader :: Maybe Bool -> String -> Maybe Bool
+    scanHeader cur [] = cur
+    scanHeader cur s@(c:_)
+      | isSpace c = scanHeader cur (tail s)
+      | "--" `isPrefixOf` s = scanHeader cur (dropLine s)
+      | "{-#" `isPrefixOf` s =
+          case readPragma (drop 3 s) of
+            Nothing -> cur                      -- unterminated pragma, give up
+            Just (content, rest) -> scanHeader (applyLang content cur) rest
+      | "{-" `isPrefixOf` s = scanHeader cur (dropNested 1 (drop 2 s))
+      | "#" `isPrefixOf` s = scanHeader cur (dropLine s)   -- e.g. '#line 1 "file.hs"'
+      | isModuleKw s = cur                      -- the header ends at 'module'
+      | otherwise = cur                         -- first top-level declaration
+
+    isModuleKw s = "module" `isPrefixOf` s && notIdentChar (drop 6 s)
+    notIdentChar [] = True
+    notIdentChar (c:_) = not (isAlphaNum c || c == '_' || c == '\'')
+
+    dropLine s = case dropWhile (/= '\n') s of [] -> []; (_:cs) -> cs
+
+    dropNested :: Int -> String -> String
+    dropNested 0 rest = rest
+    dropNested _ [] = []
+    dropNested n ('{':'-':cs) = dropNested (n+1) cs
+    dropNested n ('-':'}':cs) = dropNested (n-1) cs
+    dropNested n (_:cs) = dropNested n cs
+
+    -- Split off the contents of a '{-# ... #-}' pragma (after the '{-#').
+    readPragma :: String -> Maybe (String, String)
+    readPragma = loop (1 :: Int) []
+      where
+        loop _ _ [] = Nothing
+        loop n acc ('{':'-':cs) = loop (n+1) ('-':'{':acc) cs
+        loop n acc ('-':'}':cs)
+          | n <= 1    = Just (reverse acc, cs)
+          | otherwise = loop (n-1) ('}':'-':acc) cs
+        loop n acc (c:cs) = loop n (c:acc) cs
+
+    -- Update the setting from a LANGUAGE pragma; other pragmas are ignored.
+    applyLang :: String -> Maybe Bool -> Maybe Bool
+    applyLang content cur =
+      case words content of
+        ("LANGUAGE":rest) -> foldl applyExt cur (splitComma (unwords rest))
+        _                 -> cur
+      where
+        applyExt _ e | e == "NoImplicitPrelude" = Just True
+        applyExt c e | e == "ImplicitPrelude"   = Just False
+                     | otherwise                = c
+
+    splitComma :: String -> [String]
+    splitComma s =
+      case break (== ',') s of
+        (a, ',':b) -> trim a : splitComma b
+        (a, _)     -> [trim a]
+    trim = reverse . dropWhile isSpace . reverse . dropWhile isSpace
 
 -------------------------------------------
 

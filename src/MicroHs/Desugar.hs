@@ -21,6 +21,7 @@ import MicroHs.Exp
 import MicroHs.Flags
 import MicroHs.Graph
 import MicroHs.Ident
+import qualified MicroHs.IdentMap as M
 import MicroHs.List
 import MicroHs.Names
 import MicroHs.State as S
@@ -73,7 +74,7 @@ dsDef flags mn ffiNo adef =
 -- If the function is impure then wrap a performIO around the call.
 ccall :: EType -> Exp -> Exp
 ccall t f =
-  case getArrows t of
+  case getArrows (dropForall t) of
     (_, EApp (EVar io) _) | io == identIO ->
       f
     (as, _) ->
@@ -83,6 +84,10 @@ ccall t f =
           perf = Lit $ LPrim "IO.performIO"
           call = App perf $ apps f (map Var xs)
       in  foldr Lam call xs
+
+dropForall :: EType -> EType
+dropForall (EForall _ _ u) = dropForall u
+dropForall u = u
 
 wrapTick :: Bool -> Ident -> Exp -> Exp
 wrapTick False _ ee = ee
@@ -411,11 +416,28 @@ dsMatrix dflt iis@(i:is) aarms@(aarm : _) =
     EVar _ -> do
       -- Find all variables, substitute with i, and proceed
       let (vars, nvars) = span (isPVar . leftMost) aarms
-          vars' = map (sub . unAt i) vars
           sub (EVar x : ps, sb, rhs) = (ps, substAlpha x i . sb, rhs)
           sub _ = impossible
-      letBind (dsMatrix dflt iis nvars) $ \ drest ->
-        dsMatrix drest is vars'
+          single = do
+            let vars' = map (sub . unAt i) vars
+            letBind (dsMatrix dflt iis nvars) $ \ drest ->
+              dsMatrix drest is vars'
+      if null nvars then do
+        -- Every arm starts with a variable: substitute a batch of leading
+        -- all-variable columns at once instead of one column at a time.
+        let maxK = length iis
+            colIsVar j = all (\(ps, _, _) -> case drop j ps of (EVar _:_) -> True; _ -> False) aarms
+            k = length (takeWhile colIsVar [0 .. maxK - 1])
+        if k >= 2 then do
+          let (isPref, isRest) = splitAt k iis
+              varsBatch = map (\(ps, sb, rhs) ->
+                let (pPref, psRest) = splitAt k ps
+                    mp = M.fromList [ (x, ex) | (EVar x, ex) <- zip pPref isPref, not (isDummyIdent x) ]
+                in  (psRest, (if M.null mp then id else substExpMany mp) . sb, rhs)) aarms
+          letBind (dsMatrix dflt iis []) $ \ drest ->
+            dsMatrix drest isRest varsBatch
+        else single
+      else single
     -- Collect identical transformations, do the transformation and proceed.
     EViewPat e _ -> do
       let e' = case unAt i aarm of (_, sub, _) -> sub (dsExpr e)
@@ -522,6 +544,30 @@ substAlpha x y e =
   else
     substExp x y e
 
+-- Capture-avoiding simultaneous substitution of many variables.
+-- Traverses the expression once instead of once per variable.
+substExpMany :: M.Map Exp -> Exp -> Exp
+substExpMany mp ae
+  | M.null mp = ae
+  | otherwise = go mp ae
+  where
+    rngVars = M.fromList [ (v, ()) | e <- M.elems mp, v <- freeVars e ]
+    go m e =
+      case e of
+        Var i -> fromMaybe e (M.lookup i m)
+        App f a -> App (go m f) (go m a)
+        Lit _ -> e
+        Lam i b ->
+          let m' = M.delete i m
+          in  if M.null m' then e
+              else if isJust (M.lookup i rngVars) then
+                let j = head [ v | n <- enumFrom (0::Int),
+                                   let { v = mkIdent ("a" ++ show n) },
+                                   v `notElem` allVarsExp b, v `notElem` M.keys m', v `notElem` M.keys rngVars ]
+                in  Lam j (go m' (substExp i (Var j) b))
+              else
+                Lam i (go m' b)
+
 pConOf :: HasCallStack =>
           EPat -> Con
 pConOf apat =
@@ -532,12 +578,12 @@ pConOf apat =
     _ -> impossiblePP apat
 
 pArgs :: EPat -> [EPat]
-pArgs apat =
-  case apat of
-    ECon _ -> []
-    EApp f a -> pArgs f ++ [a]
-    ELit _ _ -> []
-    _ -> impossible
+pArgs = go []
+  where
+    go acc (ECon _)   = acc
+    go acc (EApp f a) = go (a : acc) f
+    go acc (ELit _ _) = acc
+    go _   _          = impossible
 
 getDups :: (Ord a) => [a] -> [[a]]
 getDups = filter ((> 1) . length) . groupSort

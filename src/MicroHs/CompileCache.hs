@@ -1,6 +1,6 @@
 module MicroHs.CompileCache(
   CModule,
-  Cache, addWorking, getWorking, emptyCache, deleteFromCache, workToDone, addBoot, getBoots,
+  Cache, addWorking, clearWorking, getWorking, emptyCache, deleteFromCache, workToDone, addBoot, getBoots,
   cachedModules, cachedModuleNames, cachedNonPkgModuleNames,
   lookupCache, lookupCacheChksum, getImportDeps,
   addPackage, getCompMdls, getPathPkgs, getPkgs, getEmbedPkgs,
@@ -79,6 +79,9 @@ getBoots = boots
 getWorking :: Cache -> [IdentModule]
 getWorking = working
 
+clearWorking :: Cache -> Cache
+clearWorking c = c{ working = [] }
+
 addWorking :: IdentModule -> Cache -> Cache
 addWorking mn c =
   let ws = working c
@@ -134,7 +137,7 @@ addPackage mf p c = c{
   where ins t = M.insert (tModuleName t) (PkgMdl t)
 
 saveCache :: FilePath -> Cache -> IO ()
-saveCache fn cash = writeSerializedCompressed fn (forceCache cash)
+saveCache fn cash = writeSerialized fn (forceCache cash)
 
 loadCached :: FilePath -> IO (Maybe Cache)
 loadCached fn = do

@@ -3,9 +3,11 @@ module MicroHs.Abstract(
   -- reduce,
   ) where
 import qualified Prelude(); import MHSPrelude
+import Data.Maybe(isNothing)
 import MicroHs.Ident
 import MicroHs.Exp
 import MicroHs.Expr(Lit(..))
+import qualified MicroHs.IdentMap as M
 
 --
 -- Used combinators
@@ -99,72 +101,115 @@ cC = Lit (LPrim "C")
 --------------------
 
 compileOpt :: Exp -> Exp
-compileOpt = improveT . compileExp
+compileOpt = improveT . toExp . compileExpA
 
-compileExp :: Exp -> Exp
-compileExp ae =
+-- Annotated expression with free variables at every node,
+-- so abstraction can prune dead subtrees in O(1) per node.
+data AExp
+  = AAtom Exp
+  | AApp (M.Map ()) AExp AExp
+
+fvsA :: AExp -> M.Map ()
+fvsA ae =
   case ae of
-    App f a -> App (compileExp f) (compileExp a)
-    Lam x a -> abstract x a
-    _       -> ae
+    AAtom (Var y) -> M.singleton y ()
+    AAtom _ -> M.empty
+    AApp m _ _ -> m
 
-abstract :: Ident -> Exp -> Exp
-abstract x ae =
+aAppA :: AExp -> AExp -> AExp
+aAppA f a = AApp (M.merge (fvsA f) (fvsA a)) f a
+
+aApp2A :: Exp -> AExp -> AExp -> AExp
+aApp2A c x y = aAppA (aAppA (AAtom c) x) y
+
+aApp3A :: Exp -> AExp -> AExp -> AExp -> AExp
+aApp3A c x y z = aAppA (aApp2A c x y) z
+
+toExp :: AExp -> Exp
+toExp ae =
   case ae of
-    Var y  -> if x == y then cI else aK (Var y)
-    App f a -> aS (abstract x f) (abstract x a)
-    Lam y e -> abstract x $ abstract y e
-    Lit _ -> aK ae
+    AAtom e -> e
+    AApp _ f a -> App (toExp f) (toExp a)
 
-aK :: Exp -> Exp
-aK e  = App cK e
+compileExpA :: Exp -> AExp
+compileExpA ae =
+  case ae of
+    App f a -> aAppA (compileExpA f) (compileExpA a)
+    Lam x a -> abstractA x (compileExpA a)
+    _       -> AAtom ae
 
-aS :: Exp -> Exp -> Exp
-aS a1 a2 =
- if isK a1 then cI else
+abstractA :: Ident -> AExp -> AExp
+abstractA x ae =
+  case ae of
+    AAtom (Var y) -> if x == y then AAtom cI else aKA ae
+    AAtom _       -> aKA ae
+    AApp m f a
+      | isNothing (M.lookup x m) -> aKA ae
+      | otherwise                -> aSA (abstractA x f) (abstractA x a)
+
+aKA :: AExp -> AExp
+aKA e = aAppA (AAtom cK) e
+
+data MaybeAppA = NotAppA | IsAppA AExp AExp
+
+getAppA :: AExp -> MaybeAppA
+getAppA ae =
+  case ae of
+    AApp _ f a -> IsAppA f a
+    _          -> NotAppA
+
+isPrimA :: String -> AExp -> Bool
+isPrimA s ae =
+  case ae of
+    AAtom e -> isPrim s e
+    _       -> False
+
+aSA :: AExp -> AExp -> AExp
+aSA a1 a2 =
+ if isPrimA "K" a1 then AAtom cI else
   let
-    r = aS2 a1 a2
+    r = aS2A a1 a2
   in
-    case getApp a1 of
-      NotApp -> r
-      IsApp k1 e1 ->
-        if isK k1 then
-          case getApp a2 of
-            IsApp k2 e2 ->
-              if isK k2 then
-                aK (App e1 e2)
+    case getAppA a1 of
+      NotAppA -> r
+      IsAppA k1 e1 ->
+        if isPrimA "K" k1 then
+          case getAppA a2 of
+            IsAppA k2 e2 ->
+              if isPrimA "K" k2 then
+                aKA (aAppA e1 e2)
               else
-                aB e1 a2
-            NotApp ->
-              if isI a2 then
+                aBA e1 a2
+            NotAppA ->
+              if isPrimA "I" a2 then
                 e1
               else
-                aB e1 a2
+                aBA e1 a2
         else
           r
-aS2 :: Exp -> Exp -> Exp
-aS2 a1 a2 =
-  case getApp a2 of
-    NotApp -> aS3 a1 a2
-    IsApp k2 e2 ->
-      if isK k2 then
-        aC a1 e2
+aS2A :: AExp -> AExp -> AExp
+aS2A a1 a2 =
+  case getAppA a2 of
+    NotAppA -> aS3A a1 a2
+    IsAppA k2 e2 ->
+      if isPrimA "K" k2 then
+        aCA a1 e2
       else
-        aS3 a1 a2
+        aS3A a1 a2
 
-aS3 :: Exp -> Exp -> Exp
-aS3 a1 a2 =
+aS3A :: AExp -> AExp -> AExp
+aS3A a1 a2 =
   let
-    r = app2 cS a1 a2
+    r = aApp2A cS a1 a2
   in
-    case getApp a1 of
-      NotApp -> r
-      IsApp be1 e2 ->
-        case getApp be1 of
-          NotApp -> r
-          IsApp b1 e1 ->
-            if isB b1 then
-              aS' e1 e2 a2
+    case getAppA a1 of
+      NotAppA -> r
+      IsAppA be1 e2 ->
+        case getAppA be1 of
+          NotAppA -> r
+          IsAppA b1 e1 ->
+            if isPrimA "B" b1 then
+              aS'A e1 e2 a2
             else
               r
 
@@ -179,28 +224,28 @@ aS (App (App CB e1) e2) e3     = aS' e1 e2 e3      -- S (B e1 e2) e3  = S' e1 e2
 aS e1 e2                       = App2 CS e1 e2
 -}
 
-aC :: Exp -> Exp -> Exp
-aC a1 e3 =
+aCA :: AExp -> AExp -> AExp
+aCA a1 e3 =
   let
-    r = aC2 a1 e3
+    r = aC2A a1 e3
   in
-    case getApp a1 of
-      NotApp -> r
-      IsApp x1 e2 ->
-        case getApp x1 of
-          NotApp -> r
-          IsApp bc e1 ->
-            if isB bc then
-              aC' e1 e2 e3
-            else if isC bc && isI e1 then
-              app2 cP e2 e3
+    case getAppA a1 of
+      NotAppA -> r
+      IsAppA x1 e2 ->
+        case getAppA x1 of
+          NotAppA -> r
+          IsAppA bc e1 ->
+            if isPrimA "B" bc then
+              aC'A e1 e2 e3
+            else if isPrimA "C" bc && isPrimA "I" e1 then
+              aApp2A cP e2 e3
 --            else if isC bc && isC e1 then
 --              app2 cR e2 e3
             else
               r
 
-aC2 :: Exp -> Exp -> Exp
-aC2 a1 a2 = app2 cC a1 a2
+aC2A :: AExp -> AExp -> AExp
+aC2A a1 a2 = aApp2A cC a1 a2
 
 {-
 aC (App (App CB e1) e2) e3          = aC' e1 e2 e3      -- C (B e1 e2) e3  = C' e1 e2 e3
@@ -210,45 +255,45 @@ aC (App (App C' C') e2) e3          = app2 CR e2 e3
 aC e1                   e2          = app2 C' e1 e2
 -}
 
-aB :: Exp -> Exp -> Exp
-aB a1 a2 =
+aBA :: AExp -> AExp -> AExp
+aBA a1 a2 =
   let
-    r = aB2 a1 a2
+    r = aB2A a1 a2
   in
-    case getApp a1 of
-      NotApp -> r
-      IsApp cb ck ->
-        if isB cb && isK ck && isP a2 then
-          Lit (LPrim "O")
+    case getAppA a1 of
+      NotAppA -> r
+      IsAppA cb ck ->
+        if isPrimA "B" cb && isPrimA "K" ck && isPrimA "P" a2 then
+          AAtom (Lit (LPrim "O"))
         else
           r
 
-aB2 :: Exp -> Exp -> Exp
-aB2 a1 a2 =
+aB2A :: AExp -> AExp -> AExp
+aB2A a1 a2 =
   let
-    r = aB3 a1 a2
+    r = aB3A a1 a2
   in
-    case getApp a2 of
-      IsApp x1 x2 ->
-        case getApp x1 of
-          IsApp cb ck ->
-            if isY a1 && isB cb && isK ck then
+    case getAppA a2 of
+      IsAppA x1 x2 ->
+        case getAppA x1 of
+          IsAppA cb ck ->
+            if isPrimA "Y" a1 && isPrimA "B" cb && isPrimA "K" ck then
               x2
             else
               r
-          NotApp ->
-            if isC a1 && isC x1 && isI x2 then
-              cP
+          NotAppA ->
+            if isPrimA "C" a1 && isPrimA "C" x1 && isPrimA "I" x2 then
+              AAtom cP
             else
               r
-      NotApp -> r
+      NotAppA -> r
 
-aB3 :: Exp -> Exp -> Exp
-aB3 a1 a2 =
-  if isI a1 then
+aB3A :: AExp -> AExp -> AExp
+aB3A a1 a2 =
+  if isPrimA "I" a1 then
     a2
   else
-    app2 (Lit (LPrim "B")) a1 a2
+    aApp2A (Lit (LPrim "B")) a1 a2
 
 {-
 aB (App CB CK) CP             = CO -- Cons
@@ -258,11 +303,11 @@ aB CI          e              = e  -- B I e = e
 aB e1          e2             = app2 CB e1 e2
 -}
 
-aS' :: Exp -> Exp -> Exp -> Exp
-aS' e1 e2 e3 = app3 (Lit (LPrim "S'")) e1 e2 e3
+aS'A :: AExp -> AExp -> AExp -> AExp
+aS'A e1 e2 e3 = aApp3A (Lit (LPrim "S'")) e1 e2 e3
 
-aC' :: Exp -> Exp -> Exp -> Exp
-aC' e1 e2 e3 = app3 (Lit (LPrim "C'")) e1 e2 e3
+aC'A :: AExp -> AExp -> AExp -> AExp
+aC'A e1 e2 e3 = aApp3A (Lit (LPrim "C'")) e1 e2 e3
 
 improveT :: Exp -> Exp
 improveT ae =
