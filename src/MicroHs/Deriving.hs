@@ -119,7 +119,7 @@ expandField def                                            = return [def]
 -- Records with more fields than this skip the generated SetField
 -- instances; record updates on them go through case desugaring instead.
 largeRecordFieldLimit :: Int
-largeRecordFieldLimit = 32
+largeRecordFieldLimit = 64
 
 genHasFields :: LHS -> [Constr] -> T [EDef]
 genHasFields lhs cs = do

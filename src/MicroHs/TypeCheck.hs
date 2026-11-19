@@ -3338,12 +3338,12 @@ needDsCase ex lbls ae =
             Just (Newtype _ c _) -> return $ if not (null ts) ||     needC c  then Just [c] else Nothing
             _ -> return Nothing        -- we don't know which type it is
     -- Does a constructor need a case?
-    -- Large records (> 32 fields, see largeRecordFieldLimit in Deriving)
+    -- Large records (> 64 fields, see largeRecordFieldLimit in Deriving)
     -- always use case desugaring for updates, since no SetField
     -- instance is generated for them.
     needC :: Constr -> Bool
     needC (Constr _ _ _ _ (Left _)) = False
-    needC (Constr vs _ _ _ (Right fs)) = not (null vs) || length fs > 32 || any (isForall . snd . snd) fs
+    needC (Constr vs _ _ _ (Right fs)) = not (null vs) || length fs > 64 || any (isForall . snd . snd) fs
       where isForall (EForall _ _ _) = True
             isForall _ = False
     needL :: Ident -> T (Maybe [Constr])
