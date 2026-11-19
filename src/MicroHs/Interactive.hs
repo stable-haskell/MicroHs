@@ -590,7 +590,7 @@ updateTCStateCache (EModule mn es ds) = do
     flgs <- gets isFlags
     cash <- gets isCache
 --    putStrLnI "*** update tcstate"
-    let mdl' = addPreludeImport mdl
+    let mdl' = addPreludeImport (noImplicitPrelude flgs) mdl
     ((_, syms, tcstate), ch) <- liftIO $ runStateIO (compileInteractive flgs mdl') cash
     let idmap = translateMap $ concatMap tBindingsOf $ cachedModules ch
 --    putStrLnI $ "*** update isFast " ++ show nImps

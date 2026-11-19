@@ -1,6 +1,7 @@
 module MicroHs.Flags(
   Flags(..), verbosityGT, defaultFlags,
   DumpFlag(..), dumpIf,
+  applyXFlag,
   wantGMP) where
 import qualified Prelude(); import MHSPrelude
 import MicroHs.Config
@@ -37,6 +38,7 @@ data Flags = Flags {
   fPgm       :: Maybe String, -- preprocessor for -F
   fArgs      :: [String],   -- arguments for preprocessor
   doF        :: Bool,       -- run preprocessor
+  noImplicitPrelude :: Bool, -- disable the implicit 'import Prelude'
   interactive:: Bool,       -- enter interactive mode
   evalArg    :: Maybe String, -- evaluate an expression
   editor     :: Maybe String, -- Hugs-like flag to invoke the editor.
@@ -83,6 +85,7 @@ defaultFlags = Flags {
   fPgm       = Nothing,
   fArgs      = [],
   doF        = False,
+  noImplicitPrelude = False,
   interactive = False,
   evalArg     = Nothing,
   editor      = Nothing,
@@ -99,3 +102,11 @@ dumpIf :: Monad m => Flags -> DumpFlag -> m () -> m ()
 dumpIf flags df act | df `elem` dfs || Dall `elem` dfs = act
                     | otherwise = return ()
   where dfs = dumpFlags flags
+
+-- Handle a -X... language extension flag (the "X" prefix already stripped).
+-- Returns the updated flags for a known extension, Nothing for unknown ones.
+-- Unknown -X flags are ignored cleanly by the caller.
+applyXFlag :: Flags -> String -> Maybe Flags
+applyXFlag f "NoImplicitPrelude" = Just f{ noImplicitPrelude = True }
+applyXFlag f "ImplicitPrelude"   = Just f{ noImplicitPrelude = False }
+applyXFlag _ _                   = Nothing

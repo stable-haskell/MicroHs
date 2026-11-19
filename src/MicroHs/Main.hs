@@ -197,6 +197,9 @@ decodeArgs f mdls (arg:args) =
     _ | Just r  <- stripPrefix "-ddump-" arg, Just d <- lookup r dumpFlagTable ->
                    decodeArgs f{dumpFlags = d : dumpFlags f} mdls args
 
+    '-':'X':ext | Just f' <- applyXFlag f ext -> decodeArgs f' mdls args
+    '-':'X':_  -> decodeArgs f mdls args   -- ignore unknown -X flags cleanly
+
     '-':_       -> mhsError $ "Unknown flag: " ++ arg ++ "\n" ++ usage
     _ | arg `hasTheExtension` ".c" || arg `hasTheExtension` ".o" || arg `hasTheExtension` ".a"
                 -> decodeArgs f{cArgs = cArgs f ++ [arg]} mdls args
@@ -264,7 +267,7 @@ mainBuildPkg flags namever amns = do
   t1 <- getTimeMilli
   when (verbose flags > 0) $
     putStrLn $ "Writing package " ++ namever ++ " to " ++ output flags
-  writeSerializedCompressed (output flags) (forcePackage pkg)
+  writeSerialized (output flags) (forcePackage pkg)
   t2 <- getTimeMilli
   when (verbose flags > 0) $
     putStrLn $ "Compression time " ++ show (t2 - t1) ++ " ms"
@@ -273,13 +276,15 @@ mainNoCode :: Flags -> [String] -> IO ()
 mainNoCode flags amns = do
   when (verbose flags > 0) $
     putStrLn "Building"
-  let mns = map mkIdent amns
+  let mns = map (mkIdentSLoc (SLoc "command-line" 0 0)) amns
   t1 <- getTimeMilli
-  cash <- compileMany flags mns emptyCache
+  cash0 <- getCached flags
+  cash <- compileMany flags mns cash0
   let mdls = getCompMdls cash
-  force mdls `seq` putStrLn "No code generated"
+  force mdls `seq` maybeSaveCache flags cash
+  putStrLn "No code generated"
   t2 <- getTimeMilli
-  when (verbose flags > 0) $
+  when (verbose flags > 0 || speed flags) $
     putStrLn $ "Build time " ++ show (t2 - t1) ++ " ms"
 
 splitNameVer :: String -> (String, Version)
