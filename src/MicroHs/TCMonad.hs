@@ -177,7 +177,10 @@ data TCState = TC {
                   ArgDicts              -- dictionary arguments
                  ),
   constraints :: Constraints,           -- constraints that have to be solved
-  defaults    :: Defaults              -- current defaults
+  defaults    :: Defaults,             -- current defaults
+  famEqTable  :: [(EType, EType)],     -- given equalities with a stuck family application head
+  impEqTable  :: M.Map (TypeEqTable, [(EType, EType)]),
+  savedTypeTable :: TypeTable          -- types saved when bumping TCType -> TCKind (in-memory only, never serialized)
   }
   deriving (Show)
 
@@ -247,6 +250,15 @@ putConstraints es = modify $ \ ts -> ts{ constraints = es }
 
 putDefaults :: Defaults -> T ()
 putDefaults ds = modify $ \ ts -> ts{ defaults = ds }
+
+getFamEqTable :: T [(EType, EType)]
+getFamEqTable = gets famEqTable
+
+putFamEqTable :: [(EType, EType)] -> T ()
+putFamEqTable es = modify $ \ ts -> ts{ famEqTable = es }
+
+addFamEq :: (EType, EType) -> T ()
+addFamEq e = modify $ \ ts -> ts{ famEqTable = e : famEqTable ts }
 
 
 type TRef = Int

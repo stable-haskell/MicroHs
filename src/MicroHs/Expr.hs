@@ -5,7 +5,7 @@ module MicroHs.Expr(
   ImportSpec(..),
   ImportItem(..),
   ImpType(..),
-  EDef(..), showEDefs,
+  EDef(..), TypeEqn, showEDefs,
   Deriving(..), DerStrategy(..), doNotDerive,
   Expr(..), eLam, eLamWithSLoc, eEqn, oneAlt, eEqns, showExpr, eqExpr,
   XTCState,
@@ -103,7 +103,13 @@ data EDef
   -- because then we cannot bootstrap with Hugs.
   -- So instead we use dummy placeholder type and then use unsafeCoerce for the values.
   | SetTCState XTCState
+  | TypeFam LHS (Maybe EKind) [Bool] (Maybe [TypeEqn])
+  | TypeInst [IdKind] Ident [EType] EType
+  | DataFam LHS (Maybe EKind)
+  | DataInst Bool [IdKind] Ident [EType] [Constr] [Deriving]
   deriving (Show)
+
+type TypeEqn = ([IdKind], [EType], EType)
 
 instance NFData EDef where
   rnf (Data a b c) = rnf a `seq` rnf b `seq` rnf c
@@ -124,6 +130,10 @@ instance NFData EDef where
   rnf (StandDeriving a b c) = rnf a `seq` rnf b `seq` rnf c
   rnf (DfltSign a b) = rnf a `seq` rnf b
   rnf (SetTCState a) = seq a ()
+  rnf (TypeFam a b c d) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d
+  rnf (TypeInst a b c d) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d
+  rnf (DataFam a b) = rnf a `seq` rnf b
+  rnf (DataInst a b c d e f) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf e `seq` rnf f
 
 data XTCState
 instance Eq XTCState where _ == _  =  True
@@ -329,6 +339,7 @@ conArity (ConSyn _ n _) = n
 conFields :: Con -> [FieldName]
 conFields (ConData _ _ fs) = fs
 conFields (ConNew _ fs) = fs
+conFields (ConSyn _ _ (ETuple (_ : es), _)) = [ f | EVar f <- es ]
 conFields ConSyn{} = []
 
 instance Eq Con where
@@ -583,6 +594,10 @@ instance HasLoc EDef where
   getSLoc (Infix _ is) = getSLoc is
   getSLoc (Instance t _ _) = getSLoc t
   getSLoc (StandDeriving _ _ t) = getSLoc t
+  getSLoc (TypeFam (i, _) _ _ _) = getSLoc i
+  getSLoc (TypeInst _ i _ _) = getSLoc i
+  getSLoc (DataFam (i, _) _) = getSLoc i
+  getSLoc (DataInst _ _ i _ _ _) = getSLoc i
   getSLoc _ = error "HasLoc EDef: unimplemented"
 
 -- Approximate location; only identifiers and literals carry a location
@@ -738,6 +753,10 @@ allVarsBind' abind =
     Sign is _ -> (is ++)
     DfltSign i _ -> (i:)
     Infix _ _ -> id
+    TypeFam{} -> id
+    TypeInst{} -> id
+    DataFam{} -> id
+    DataInst{} -> id
     _ -> impossible
 
 allVarsEqns :: HasCallStack => [Eqn] -> [Ident]
@@ -915,6 +934,10 @@ instance Pretty EDef where
     StandDeriving _s _narg ct -> text "deriving instance" <+> pPrint0 l ct
     DfltSign i t -> text "default" <+> pPrint0 l i <+> text "::" <+> pPrint0 l t
     SetTCState _ -> text "SetTCState ..."
+    TypeFam lhs mk _ _ -> text "type family" <+> ppLHS l lhs <+> maybe empty (\k -> text "::" <+> pPrint0 l k) mk
+    TypeInst _ i ts t -> text "type instance" <+> pPrint0 l (eApps (EVar i) ts) <+> text "=" <+> pPrint0 l t
+    DataFam lhs mk -> text "data family" <+> ppLHS l lhs <+> maybe empty (\k -> text "::" <+> pPrint0 l k) mk
+    DataInst isNew _ i ts _ ds -> text (if isNew then "newtype instance" else "data instance") <+> pPrint0 l (eApps (EVar i) ts) <+> ppDerivings l ds
 
 ppDerivings :: PrettyLevel -> [Deriving] -> Doc
 ppDerivings l = sep . map (ppDeriving l)
@@ -1241,7 +1264,7 @@ freeTyVars = foldr (go []) []
     go _bound (EQLit _ _ _) acc = acc
     go bound (EOper e ies) acc = go bound e (goList bound (map snd ies) acc)
     go bound (ESign e _) acc = go bound e acc
-    go bound (EListish (LList [e])) acc = go bound e acc
+    go bound (EListish (LList es)) acc = goList bound es acc
     go bound (ETuple es) acc = goList bound es acc
     go bound (EParen e) acc = go bound e acc
     go bound (EQVar e _) acc = go bound e acc

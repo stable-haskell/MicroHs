@@ -82,7 +82,9 @@
 /*
  * overflow detection in arithmetic
  */
-#define WANT_OVERFLOW 1
+#if !defined(WANT_OVERFLOW)
+#define WANT_OVERFLOW 0
+#endif
 
 /*
  * Enable non-blocking IO polling.

@@ -68,3 +68,8 @@ instance (NFData a, NFData b) => NFData (Either a b) where
 instance (NFData a, NFData b) => NFData (a, b) where
   rnf (a, b) = rnf a `seq` rnf b
 
+instance (NFData a, NFData b, NFData c) => NFData (a, b, c) where
+  rnf (a, b, c) = rnf a `seq` rnf b `seq` rnf c
+
+instance (NFData a, NFData b, NFData c, NFData d) => NFData (a, b, c, d) where
+  rnf (a, b, c, d) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d

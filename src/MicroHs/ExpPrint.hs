@@ -4,7 +4,7 @@ import qualified Prelude(); import MHSPrelude
 import qualified Data.ByteString.Char8 as BS
 import Data.Char(ord, chr)
 import Data.Function(on)
-import Data.List(nubBy)
+import Data.List(nubBy, isSuffixOf)
 import qualified MicroHs.IdentMap as M
 import Data.Maybe
 import MicroHs.Desugar(LDef)
@@ -12,7 +12,7 @@ import MicroHs.EncodeData(encList)
 import MicroHs.Error(mhsError)
 import MicroHs.Exp
 import MicroHs.Expr(Lit(..), showLit, errorMessage, HasLoc(..), CType)
-import MicroHs.Ident(Ident, showIdent, mkIdent, showSLoc)
+import MicroHs.Ident(Ident, showIdent, mkIdent, unIdent, showSLoc)
 import MicroHs.List(groupSort)
 import MicroHs.State
 import MicroHs.TypeCheck(isInstId)
@@ -36,7 +36,15 @@ removeUnused (ds, emain) = dfs roots M.empty
     dfs [] done = M.toList done
     dfs (i:is) done | isJust (M.lookup i done) = dfs is done
                     | otherwise = dfs (freeVars e ++ is) (M.insert i e done)
-                                  where e = fromMaybe (error $ "removeUnused: undef " ++ show i) $ M.lookup i dMap
+                                  where e = fromMaybe (error $ "removeUnused: undef " ++ show i) $
+                                              case M.lookup i dMap of
+                                                Just e' -> Just e'
+                                                Nothing -> M.lookup i bootSelMap
+    -- .hs-boot files may declare a record selector as a plain value
+    -- `<Mod>.<fld>`, whereas the .hs module defines it under
+    -- `<Mod>.get$.<TyCon>.<fld>`; map the latter to the former.
+    bootSelMap :: M.Map Exp
+    bootSelMap = M.fromList [ (alias, Var k) | (k, _) <- M.toList dMap, Just alias <- [bootSelAlias k] ]
 
 renumberCMdl :: CMdl -> (ForExpTable, CMdl)
 renumberCMdl (ds, emain) =
@@ -51,6 +59,11 @@ renumberCMdlM :: [(Ident, CType, IsJavascript)] -> M.Map Exp -> Exp -> (ForExpTa
 renumberCMdlM fexps dMap emain =
   let
     roots = freeVars emain ++ [ i | (i, _, _) <- fexps ]
+    -- .hs-boot files may declare a record selector as a plain value
+    -- `<Mod>.<fld>`, whereas the .hs module defines it under
+    -- `<Mod>.get$.<TyCon>.<fld>`; resolve the former to the latter.
+    bootSelMap :: M.Map Exp
+    bootSelMap = M.fromList [ (alias, Var k) | (k, _) <- M.toList dMap, Just alias <- [bootSelAlias k] ]
     -- Shake the tree bottom-up, renaming identifiers as we go along.
     -- This is much faster than (say) computing the sccs and walking that.
     dfs :: Ident -> State (Int, M.Map Exp, [LDef]) ()
@@ -62,7 +75,9 @@ renumberCMdlM fexps dMap emain =
           -- Put placeholder for n in seen.
           put (i, M.insert n (Var n) seen, r)
           -- Walk n's children
-          let e = findIdentIn n dMap
+          let e = case M.lookup n dMap of
+                    Just e' -> e'
+                    Nothing -> findIdentIn n bootSelMap
           mapM_ dfs $ freeVars e
           -- Now that n's children are done, compute its actual entry.
           (i', seen', r') <- get
@@ -82,6 +97,21 @@ renumberCMdlM fexps dMap emain =
             unVar _ = undefined
   in
     (fexps', (res, substv emain))
+
+-- When a .hs-boot file declares a record selector `fld :: T -> a` as a plain
+-- value, SOURCE importers reference `<Mod>.<fld>`, whereas the .hs module
+-- compiles the selector under `<Mod>.get$.<TyCon>.<fld>` (Deriving.mkGetName).
+-- Map the latter identifier to the former so linking can resolve it.
+bootSelAlias :: Ident -> Maybe Ident
+bootSelAlias k =
+  case break (== '$') (unIdent k) of
+    (pfx, '$':'.':rest)
+      | ".get" `isSuffixOf` pfx ->
+          let modName = take (length pfx - 4) pfx
+          in case break (== '.') rest of
+               (_, '.':fld) | notElem '.' fld -> Just (mkIdent (modName ++ "." ++ fld))
+               _ -> Nothing
+    _ -> Nothing
 
 -- The argument is all definitions and the main expression.
 -- The result is the program as a string.

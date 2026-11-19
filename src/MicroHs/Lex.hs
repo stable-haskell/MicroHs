@@ -164,7 +164,15 @@ lex loc (d:cs) | isSpec d =
   TSpec loc d : lex (addCol loc 1) cs
 lex loc ('"':'"':'"':cs) = lexLitStr (lexStringCont loc) loc (addCol loc 3) isTrip   multiLine (\ _ _ -> Nothing) cs
 lex loc ('"':cs)         = lexLitStr (lexStringCont loc) loc (addCol loc 1) isDQuote id        (\ _ _ -> Nothing) cs
-lex loc ('\'':cs)        = lexLitStr lexCharCont         loc (addCol loc 1) isSQuote id        (\ _ _ -> Nothing) cs
+-- A leading '\'' is a Char literal when it has one of the two standard shapes:
+--   '\'' : '\\' : _          an escape (handled by lexLitStr, e.g. '\n', '\x41', '\\', '\'')
+--   c : '\'' : _             a simple literal (e.g. 'A', ':', '[', '(', ' '), trailing '#'s skipped
+-- Otherwise it is a DataKinds promotion tick ('Con, 'M.Con, ':, '++, '[, '(), ...).
+lex loc ('\'':cs)
+  | ('\\':_) <- cs = lexLitStr lexCharCont loc (addCol loc 1) isSQuote id (\ _ _ -> Nothing) cs
+  | (c:'\'':rs) <- cs, c /= '\'' && c /= '\\' && c /= '\n' && c /= '\r' =
+      TChar loc c : lexSkipHash (addCol loc 3) rs
+  | otherwise = lexTick loc cs
   where isSQuote ('\'':_) = Just 1
         isSQuote _ = Nothing
         lexCharCont _ [c] loc' cs' = TChar loc c : lexSkipHash loc' cs'
@@ -172,6 +180,32 @@ lex loc ('\'':cs)        = lexLitStr lexCharCont         loc (addCol loc 1) isSQ
 
 lex loc (d:_) = [TError loc $ "Unrecognized input: " ++ show d]
 lex loc [] = [TEnd loc]
+
+-- Lex the remainder of a DataKinds promotion tick; loc is the '\'' position.
+lexTick :: SLoc -> String -> [Token]
+lexTick loc cs@(d:_)
+  | isUpper d    = tickUpper (addCol loc 1) loc [] cs   -- 'Con, 'M.N.Con (with trailing '#'s)
+  | isOperChar d = let (ops, rs) = span isOperChar cs  -- ':, ':|, '++, ...
+                   in  TIdent loc [] ('\'' : ops) : lex (addCol loc (1 + length ops)) rs
+  | otherwise    = TSpec loc '\'' : lex (addCol loc 1) cs   -- '[, '(, or a stray '\''
+lexTick loc []   = TSpec loc '\'' : lex (addCol loc 1) []
+
+-- Scan 'M1.M2.Con after the tick, mirroring upperIdent but keeping the tick
+-- on the final name: 'Con -> "'Con", 'M.Con -> M."'Con".
+tickUpper :: SLoc -> SLoc -> [String] -> String -> [Token]
+tickUpper loc sloc qs acs =
+  case span isIdentChar acs of
+   (ds, rs) ->
+    case rs of
+      '.':cs@(d:_) | isUpper d    -> tickUpper (addCol loc $ 1 + length ds) sloc (ds:qs) cs
+                   | isLower_ d   -> let (xs, ys) = spanIdent cs
+                                     in  TIdent sloc (reverse (ds:qs)) ('\'' : xs) : lex (addCol loc $ 1 + length ds + length xs) ys
+                   | isOperChar d -> let (xs, ys) = span isOperChar cs
+                                     in  TIdent sloc (reverse (ds:qs)) ('\'' : xs) : lex (addCol loc $ 1 + length ds + length xs) ys
+                   | otherwise    -> mk ds rs
+      '#':_ -> mk (ds ++ hs) rs' where (hs, rs') = span (== '#') rs
+      _ -> mk ds rs
+  where mk ds rs = TIdent sloc (reverse qs) ('\'' : ds) : lex (addCol loc $ length ds) rs
 
 lexStringCont :: SLoc -> [[Token]] -> String -> SLoc -> String -> [Token]
 lexStringCont loc _ s loc' ('#':cs) = TBStr   loc (pack s) : lex (addCol loc' 1) cs
@@ -453,9 +487,12 @@ tIdent loc qs kw ats | elem kw ["let", "where", "do", "of", "mdo"]
                                  = ti : tBrace ats
                      | otherwise = ti : ats
   where
-    isBar (TSpec _ '|' : _) = True
-    isBar (TIndent _ : TSpec _ '|' : _) = True
-    isBar _ = False
+    isBar ts = case dropWhile isSkipped ts of
+                 TSpec _ '|' : _ -> True
+                 _              -> False
+    isSkipped (TIndent _) = True
+    isSkipped (TPragma _ _) = True
+    isSkipped _ = False
 
     ti = TIdent loc qs kw
 
@@ -490,7 +527,7 @@ pragma loc cs =
   let skip = skipNest loc 1 ('#':cs)
       (p, rest) = break isSpace (dropWhile isSpace cs)
   in  case map toUpper p of
-        "SOURCE" -> TPragma loc p : skip
+        "SOURCE" -> TPragma loc "SOURCE" : skip
         -- hsc2hs generates LINE pragmas
         "LINE" | Just loc' <- lineDirective loc rest -> skipNest loc' 1 ('#':cs)
         _ -> skip
@@ -534,6 +571,9 @@ newtype LexState = LS (Cmd -> (Token, LexState))
 
 data Cmd = Next | Raw | Pop
 
+-- Negative entries (-n) on the layout stack represent MultiWayIf ('if |')
+-- layout blocks opened at column n: per GHC's IfLayout rule, a synthetic ';'
+-- at column n is only inserted before '|', never before ',' or '->'.
 layoutLS ::                [Token] ->    [Int] -> Cmd      -> (Token,                    LexState)
 layoutLS                        ts           ms  Raw        = (TRaw ts,                  LS $ layoutLS  ts     ms )
 layoutLS                        ts          mms  Pop        =
@@ -541,12 +581,19 @@ layoutLS                        ts          mms  Pop        =
                                                      (m:ms,_:_) | m/=0 -> (TEnd (tokensLoc ts),  LS $ layoutLS  ts     ms )
                                                      _ ->     (TError l "syntax error",  LS $ layoutLS  []     [] ) where l = tokensLoc ts
 -- The rest are the Next commands
-layoutLS tts@(TIndent x       : ts) mms@(m : ms) _ | n == m = (TSpec (tokensLoc ts) ';', LS $ layoutLS  ts    mms )
-                                                   | n <  m = (TSpec (tokensLoc ts) '>', LS $ layoutLS tts     ms ) where {n = getCol x}
+layoutLS tts@(TIndent x       : ts) mms@(m : ms) _ | n < am = (TSpec (tokensLoc ts) '>', LS $ layoutLS tts     ms )
+                                                   | n == am && (m > 0 || isBarTok ts)
+                                                            = (TSpec (tokensLoc ts) ';', LS $ layoutLS  ts    mms ) where {n = getCol x; am = abs m}
 layoutLS     (TIndent _       : ts)          ms  _          =                                 layoutLS  ts     ms  Next
 layoutLS     (t@(TIdent _ _ "do") :  -- for NondecreasingIndentation
-              TBrace x        : ts) mms@(m :  _) _ | n >= m = (t                       , LS $ layoutLS  (TSpec (tokensLoc ts) '<' : ts) (n:mms)) where {n = getCol x}
-layoutLS     (TBrace x        : ts) mms@(m :  _) _ | n > m  = (TSpec (tokensLoc ts) '<', LS $ layoutLS  ts (n:mms)) where {n = getCol x}
+              TBrace x        : ts) mms@(m :  _) _ | n >= abs m = (t                   , LS $ layoutLS  (TSpec (tokensLoc ts) '<' : ts) (n:mms)) where {n = getCol x}
+layoutLS     (t@(TIdent _ [] "if") : -- for MultiWayIf
+              TBrace x        : ts) mms@(m :  _) _ | n > abs m  = (t                   , LS $ layoutLS  (TSpec (tokensLoc ts) '<' : ts) ((-n):mms)) where {n = getCol x}
+layoutLS     (t@(TIdent _ [] "if") :
+              TBrace x        : ts)          []  _ | n > 0      = (t                   , LS $ layoutLS  (TSpec (tokensLoc ts) '<' : ts) [-n]) where {n = getCol x}
+layoutLS     (t@(TIdent _ [] "if") :
+              TBrace x        : ts)          ms  _              = (t                   , LS $ layoutLS  (TSpec (tokensLoc ts) '<' : TSpec (tokensLoc ts) '>' : TIndent x : ts) ms)
+layoutLS     (TBrace x        : ts) mms@(m :  _) _ | n > abs m  = (TSpec (tokensLoc ts) '<', LS $ layoutLS  ts (n:mms)) where {n = getCol x}
 layoutLS     (TBrace x        : ts)          []  _ | n > 0  = (TSpec (tokensLoc ts) '<', LS $ layoutLS  ts     [n]) where {n = getCol x}
 layoutLS     (TBrace x        : ts)          ms  _          = (TSpec (tokensLoc ts) '<', LS $ layoutLS  (TSpec (tokensLoc ts) '>' : TIndent x : ts) ms)
 layoutLS     (t@(TSpec _ '}') : ts)     (0 : ms) _          = (                       t, LS $ layoutLS  ts     ms )
@@ -556,6 +603,11 @@ layoutLS     ts@(t@(TEnd _)   :  _)          []  _          = (                 
 layoutLS     ts@(TEnd l       :  _)     (_ : ms) _          = (TSpec l '>'             , LS $ layoutLS  ts     ms )  -- insert '>' and try again
 layoutLS     (t               : ts)          ms  _          = (                       t, LS $ layoutLS  ts     ms )
 layoutLS     []                               _  _          = error "layoutLS"
+
+isBarTok :: [Token] -> Bool
+isBarTok (TPragma _ _ : rs) = isBarTok rs
+isBarTok (TSpec _ '|' : _)  = True
+isBarTok _                  = False
 
 instance TokenMachine LexState Token where
   tmNextToken (LS f) = f Next

@@ -155,7 +155,9 @@ headIdent (Ident _ i) = head i
 isConIdent :: Ident -> Bool
 isConIdent i@(Ident _ t) =
   let c = headIdent i
-  in  isUpperX c || c == ':' || c == ',' || t == pack "[]"  || t == pack "()" || t == pack "->" || t == pack "\x2192"
+  in  isUpperX c || c == ':' || c == ',' || t == pack "[]"  || t == pack "()" || t == pack "->" || t == pack "\x2192" ||
+      -- A DataKinds promotion tick: 'Con, 'M.Con, ':, etc.
+      headIdent (unQualIdent i) == '\''
 
 isOperChar :: Char -> Bool
 isOperChar '@' = True

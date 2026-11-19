@@ -39,12 +39,7 @@ foreign import ccall "add_lzma_compressor"   c_add_lzma_compressor   :: Ptr BFIL
 foreign import ccall "add_lzma_decompressor" c_add_lzma_decompressor :: Ptr BFILE -> IO (Ptr BFILE)
 
 writeSerializedCompressed :: forall a . FilePath -> a -> IO ()
-writeSerializedCompressed p s = do
-  h <- openBinaryFile p WriteMode
-  hPutChar h 'q'                               -- indicate compressed
-  h' <- addTransducer c_add_lzma_compressor h
-  hSerialize h' s
-  hFlush h'
+writeSerializedCompressed p s = writeSerialized p s
 
 -- Read compressed or uncompressed
 readSerialized :: FilePath -> IO a
